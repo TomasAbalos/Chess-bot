@@ -53,6 +53,28 @@ def start_grid(white_at_bottom: bool) -> list[list[str]]:
     return board_to_grid(chess.Board(), white_at_bottom)
 
 
+def infer_turn_from_grid(grid: list[list[str]], white_at_bottom: bool) -> chess.Color:
+    """Infiere el turno basándose en las piezas desplazadas respecto a la posición inicial."""
+    ref_grid = start_grid(white_at_bottom)
+    if grid == ref_grid:
+        return chess.WHITE
+
+    white_displaced = 0
+    black_displaced = 0
+    for r in range(8):
+        for c in range(8):
+            actual = grid[r][c]
+            expected = ref_grid[r][c]
+            if expected.startswith("w") and actual != expected:
+                white_displaced += 1
+            elif expected.startswith("b") and actual != expected:
+                black_displaced += 1
+
+    if white_displaced > black_displaced:
+        return chess.BLACK
+    return chess.WHITE
+
+
 def _castling_rights(board: chess.Board) -> int:
     rights = 0
     if board.piece_at(chess.E1) == chess.Piece.from_symbol("K"):

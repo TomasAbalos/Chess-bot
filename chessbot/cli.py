@@ -12,9 +12,12 @@ from .engine.uci import Book, EngineClient, find_engine, parse_tc
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chessbot", description="Screen-reading chess bot")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+
+    gui = sub.add_parser("gui", help="launch graphical user interface with overlay")
 
     play = sub.add_parser("play", help="detect the on-screen board and play")
+    play.add_argument("--mode", choices=["play", "overlay"], default="play", help="play moves or show overlay suggestions")
     play.add_argument("--engine", help="path to a UCI engine (default: stockfish on PATH)")
     play.add_argument("--turn", choices=["white", "black"], help="side to move in the detected position")
     play.add_argument("--capture", choices=["auto", "mss", "dxcam"], default="auto")
@@ -109,6 +112,7 @@ def cmd_play(args) -> None:
             timing_mode=timing_mode,
             timing_window=timing_window,
             turn_arg=turn_arg,
+            mode=getattr(args, "mode", "play"),
         )
         session.run()
     finally:
@@ -127,10 +131,23 @@ def cmd_server(args) -> None:
         engine.close()
 
 
+def cmd_gui() -> None:
+    from .gui.main_window import run_gui
+
+    run_gui()
+
+
 def main(argv=None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        cmd_gui()
+        return
+
     try:
-        if args.command == "play":
+        if args.command == "gui":
+            cmd_gui()
+        elif args.command == "play":
             cmd_play(args)
         else:
             cmd_server(args)

@@ -9,6 +9,7 @@ from .vision import board_detect, move_detect
 from .vision.position import (
     board_to_grid,
     grid_to_board,
+    infer_turn_from_grid,
     infer_white_at_bottom,
     screen_to_square_name,
     start_grid,
@@ -37,9 +38,15 @@ class GameSession:
         timing_mode: str | None = None,
         timing_window: tuple[float, float] | None = None,
         turn_arg: chess.Color | None = None,
-        confidence_floor: float = 0.90,
+        confidence_floor: float = 0.75,
         confirm=input,
         log=print,
+        mode: str = "play",
+        on_suggest_move=None,
+        on_clear_suggestion=None,
+        on_board_detected=None,
+        on_position_update=None,
+        on_status=None,
     ):
         self.capturer = capturer
         self.engine = engine
@@ -55,31 +62,52 @@ class GameSession:
         self.confidence_floor = confidence_floor
         self.confirm = confirm
         self.log = log
+        self.mode = mode
+        self.on_suggest_move = on_suggest_move
+        self.on_clear_suggestion = on_clear_suggestion
+        self.on_board_detected = on_board_detected
+        self.on_position_update = on_position_update
+        self.on_status = on_status
         self.region: Region | None = None
         self.white_at_bottom = True
         self._depth_control = 32
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
 
     def locate(self, attempts: int = 30, wait: float = 1.0) -> Region:
         for _ in range(attempts):
+            if self._stopped:
+                return None
             region = board_detect.locate_board(self.capturer.grab())
             if region is not None:
                 self.region = region
+                if self.on_board_detected:
+                    self.on_board_detected(region)
                 return region
             self.log("Board not found on screen, retrying...")
             time.sleep(wait)
+        if self._stopped:
+            return None
         raise BoardNotFound("could not find a chessboard on screen; make sure it is fully visible")
 
     def read_position(self) -> tuple[chess.Board, bool]:
         img = self.capturer.grab(self.region)
         grid, confidence = self.recognizer.classify_squares(img)
         white_at_bottom = infer_white_at_bottom(grid)
-        if grid in (start_grid(True), start_grid(False)):
-            turn = chess.WHITE
-        elif self.turn_arg is not None:
+        our_color = chess.WHITE if white_at_bottom else chess.BLACK
+
+        if self.turn_arg == "my_turn":
+            turn = our_color
+        elif self.turn_arg == "opponent_turn":
+            turn = not our_color
+        elif self.turn_arg is not None and self.turn_arg in (chess.WHITE, chess.BLACK):
             turn = self.turn_arg
+        elif grid in (start_grid(True), start_grid(False)):
+            turn = chess.WHITE
         else:
-            answer = self.confirm("Whose turn is it? [w/b]: ").strip().lower()
-            turn = chess.WHITE if answer.startswith("w") else chess.BLACK
+            turn = infer_turn_from_grid(grid, white_at_bottom)
         board = grid_to_board(grid, white_at_bottom, turn)
         if float(confidence.min()) < self.confidence_floor:
             flagged = sorted(
@@ -103,30 +131,76 @@ class GameSession:
     def run(self) -> None:
         if self.region is None:
             self.locate()
+        if self._stopped or self.region is None:
+            return
         self.log(f"Board region: {self.region}")
         board, self.white_at_bottom = self.read_position()
         our_color = chess.WHITE if self.white_at_bottom else chess.BLACK
         self.log(f"Playing {chess.COLOR_NAMES[our_color]}; position: {board.fen()}")
+        if self.on_position_update:
+            self.on_position_update(board, self.white_at_bottom)
         old = self._grab_gray()
         total_moves = 0
-        while not board.is_game_over():
+        while not board.is_game_over() and not self._stopped:
             if board.turn == our_color:
-                move = self._choose_move(board, total_moves)
-                old = self._execute_move(move)
-                board.push(chess.Move.from_uci(move))
-                total_moves += 1
-                self.log(f"We played {move}")
-                continue
-            result = self._await_opponent(board, old)
+                move, top_moves, eval_score, eval_text = self._choose_move(board, total_moves)
+                if self._stopped or not move:
+                    break
+                if self.mode == "play":
+                    old = self._execute_move(move)
+                    board.push(chess.Move.from_uci(move))
+                    total_moves += 1
+                    self.log(f"We played {move}")
+                    if self.on_position_update:
+                        self.on_position_update(board, self.white_at_bottom)
+                    continue
+                else:
+                    # Modo Overlay / Asistente: no hace clics, muestra sugerencia en pantalla
+                    eval_msg = f" [Eval: {eval_text}]" if eval_text else ""
+                    self.log(f"Sugerencia: {move}{eval_msg}")
+                    if self.on_suggest_move:
+                        # Pasamos la lista de jugadas y la evaluacion
+                        try:
+                            self.on_suggest_move(top_moves or move, self.white_at_bottom, self.region, eval_text, eval_score)
+                        except TypeError:
+                            self.on_suggest_move(move, self.white_at_bottom, self.region)
+                    result = self._await_opponent(board, old, expected_turn=our_color)
+                    if self.on_clear_suggestion:
+                        self.on_clear_suggestion()
+                    if self._stopped or result[0] == "stop":
+                        break
+                    if result[0] == "resync":
+                        board = self._adopt_resync(board, result[1])
+                        old = self._grab_gray()
+                        self.log(f"Re-synced position: {board.fen()}")
+                        if self.on_position_update:
+                            self.on_position_update(board, self.white_at_bottom)
+                        continue
+                    played_move, old = result[1], result[2]
+                    board.push(chess.Move.from_uci(played_move))
+                    total_moves += 1
+                    self.log(f"Move played: {played_move}")
+                    if self.on_position_update:
+                        self.on_position_update(board, self.white_at_bottom)
+                    continue
+
+            result = self._await_opponent(board, old, expected_turn=our_color)
+            if self._stopped or result[0] == "stop":
+                break
             if result[0] == "resync":
                 board = self._adopt_resync(board, result[1])
                 old = self._grab_gray()
                 self.log(f"Re-synced position: {board.fen()}")
+                if self.on_position_update:
+                    self.on_position_update(board, self.white_at_bottom)
                 continue
             move, old = result[1], result[2]
             board.push(chess.Move.from_uci(move))
             self.log(f"They played {move}")
-        self.log(f"Game over: {board.result()}")
+            if self.on_position_update:
+                self.on_position_update(board, self.white_at_bottom)
+        if not self._stopped:
+            self.log(f"Game over: {board.result()}")
 
     def _grab_gray(self):
         return cv2.cvtColor(self.capturer.grab(self.region), cv2.COLOR_BGR2GRAY)
@@ -139,24 +213,44 @@ class GameSession:
             return current
         return resynced
 
-    def _choose_move(self, board: chess.Board, total_moves: int) -> str:
+    def _choose_move(self, board: chess.Board, total_moves: int) -> tuple[str, list[str], float, str]:
         chosen_t = sample_timing(self.timing_window) if self.timing_mode else 0.0
         start_ts = time.time()
-        move = self.book.probe(board) if total_moves < 5 else None
+        move = self.book.probe(board) if self.book else None
+        top_moves: list[str] = [move] if move else []
+        eval_score: float = 0.0
+        eval_text: str = ""
+
         if move is None:
-            if self.depth_mode:
-                move = self.engine.best_move(board, depth=self.depth)
-                self._maybe_deepen(board)
-            else:
-                if self.timing_mode in ("engine", "both"):
-                    move = self.engine.best_move(board, move_time=chosen_t)
+            try:
+                if hasattr(self.engine, "analyse_top_moves"):
+                    limit_depth = self.depth if self.depth_mode else None
+                    limit_time = chosen_t if self.timing_mode in ("engine", "both") else self.move_time
+                    top_moves, eval_score, eval_text = self.engine.analyse_top_moves(
+                        board, depth=limit_depth, move_time=limit_time, multipv=3
+                    )
+                    move = top_moves[0] if top_moves else ""
+                    if self.depth_mode:
+                        self._maybe_deepen(board)
                 else:
-                    move = self.engine.best_move(board, move_time=self.move_time)
+                    if self.depth_mode:
+                        move = self.engine.best_move(board, depth=self.depth)
+                        self._maybe_deepen(board)
+                    else:
+                        if self.timing_mode in ("engine", "both"):
+                            move = self.engine.best_move(board, move_time=chosen_t)
+                        else:
+                            move = self.engine.best_move(board, move_time=self.move_time)
+                    top_moves = [move] if move else []
+            except Exception as exc:
+                self.log(f"Error en el motor UCI: {exc} — deteniendo sesión.")
+                self._stopped = True
+                return "", [], 0.0, ""
         if self.timing_mode in ("delay", "both"):
             remaining = chosen_t - (time.time() - start_ts)
             if remaining > 0:
                 time.sleep(remaining)
-        return move
+        return move, top_moves, eval_score, eval_text
 
     def _maybe_deepen(self, board: chess.Board) -> None:
         pieces = len(board.piece_map())
@@ -181,10 +275,10 @@ class GameSession:
         self.confirm("Press Enter once the move is on the board: ")
         return self._grab_gray()
 
-    def _await_opponent(self, board: chess.Board, old):
+    def _await_opponent(self, board: chess.Board, old, expected_turn: chess.Color | None = None):
         checks_since_recognizer = 0
-        while True:
-            time.sleep(0.02)
+        while not self._stopped:
+            time.sleep(0.01)
             new = self._grab_gray()
             if move_detect.board_changed(old, new):
                 break
@@ -198,10 +292,16 @@ class GameSession:
                 if float(confidence.min()) >= self.confidence_floor and grid != board_to_grid(
                     board, self.white_at_bottom
                 ):
-                    return ("resync", self._resync())
+                    try:
+                        return ("resync", self._resync(expected_turn=expected_turn))
+                    except RuntimeError as exc:
+                        self.log(f"Re-sync fallido permanente: {exc} — continuando...")
+                        return ("stop", None, None)
+        if self._stopped:
+            return ("stop", None, None)
         stable_misses = 0
-        while True:
-            time.sleep(0.02)
+        while not self._stopped:
+            time.sleep(0.01)
             current = self._grab_gray()
             if move_detect.board_changed(new, current):
                 new = current
@@ -211,12 +311,17 @@ class GameSession:
                 return ("move", moves[0], current)
             stable_misses += 1
             if stable_misses > 40:
-                return ("resync", self._resync())
+                try:
+                    return ("resync", self._resync(expected_turn=expected_turn))
+                except RuntimeError as exc:
+                    self.log(f"Re-sync fallido permanente: {exc} — deteniendo sesión.")
+                    return ("stop", None, None)
+        return ("stop", None, None)
 
-    RESYNC_SOFT_FLOOR = 0.80
+    RESYNC_SOFT_FLOOR = 0.70
 
-    def _resync(self, attempts: int = 30, wait: float = 0.5) -> chess.Board:
-        our_color = chess.WHITE if self.white_at_bottom else chess.BLACK
+    def _resync(self, attempts: int = 30, wait: float = 0.5, expected_turn: chess.Color | None = None) -> chess.Board:
+        our_color = expected_turn if expected_turn is not None else (chess.WHITE if self.white_at_bottom else chess.BLACK)
         best: tuple[float, chess.Board] | None = None
         for _ in range(attempts):
             img = self.capturer.grab(self.region)

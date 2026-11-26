@@ -1,5 +1,7 @@
 import random
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import chess
@@ -67,7 +69,10 @@ class Book:
 
 class EngineClient:
     def __init__(self, path: str, threads: int, hash_mb: int, skill_level: int = 20):
-        self._engine = chess.engine.SimpleEngine.popen_uci(path)
+        popen_args = {}
+        if sys.platform == "win32":
+            popen_args["creationflags"] = subprocess.CREATE_NO_WINDOW
+        self._engine = chess.engine.SimpleEngine.popen_uci(path, **popen_args)
         options = {"Hash": hash_mb, "Threads": threads}
         if "Skill Level" in self._engine.options:
             options["Skill Level"] = skill_level
@@ -79,6 +84,56 @@ class EngineClient:
         else:
             limit = chess.engine.Limit(time=move_time if move_time and move_time > 0 else 0.05)
         return str(self._engine.play(board, limit, ponder=False).move)
+
+    def analyse_top_moves(
+        self,
+        board: chess.Board,
+        *,
+        depth: int | None = None,
+        move_time: float | None = None,
+        multipv: int = 3,
+    ) -> tuple[list[str], float, str]:
+        """Devuelve (lista_de_jugadas_top, eval_score_cp_o_mate, eval_texto_formateado)."""
+        if depth is not None:
+            limit = chess.engine.Limit(depth=depth)
+        else:
+            limit = chess.engine.Limit(time=move_time if move_time and move_time > 0 else 0.05)
+
+        multipv = max(1, min(multipv, len(list(board.legal_moves)) or 1))
+        analysis = self._engine.analyse(board, limit, multipv=multipv)
+
+        moves: list[str] = []
+        score_val: float = 0.0
+        score_str: str = "0.0"
+
+        # La salida de analyse puede ser lista de dicts o un solo dict
+        infos = analysis if isinstance(analysis, list) else [analysis]
+
+        for i, info in enumerate(infos):
+            pv = info.get("pv")
+            if pv and len(pv) > 0:
+                moves.append(str(pv[0]))
+
+            if i == 0 and "score" in info:
+                sc = info["score"].pov(board.turn)
+                if sc.is_mate():
+                    mate_in = sc.mate()
+                    score_val = 100.0 if mate_in and mate_in > 0 else -100.0
+                    score_str = f"M{abs(mate_in)}" if mate_in else "M"
+                else:
+                    cp = sc.score()
+                    if cp is not None:
+                        val = cp / 100.0
+                        score_val = val
+                        score_str = f"{val:+.1f}" if val != 0 else "0.0"
+
+        if not moves:
+            # Fallback en caso de que pv esté vacío
+            res = self._engine.play(board, limit, ponder=False)
+            if res.move:
+                moves.append(str(res.move))
+
+        return moves, score_val, score_str
 
     def close(self) -> None:
         self._engine.quit()

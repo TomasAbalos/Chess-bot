@@ -38,8 +38,14 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Environment/version managers
-.python-version
+# Backups and temporary files
+*.bak
+*.tmp
+*.log
+
+# PyInstaller build artifacts
+*.spec.bak
+
 
 # ML datasets and training artifacts
 captures/

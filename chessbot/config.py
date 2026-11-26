@@ -9,8 +9,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class Settings:
     threads: int = 4
     hash_mb: int = 512
-    depth: int = 12
-    move_time: float = 2.0
+    depth: int = 10
+    move_time: float = 0.05
     book_path: Path = field(default_factory=lambda: REPO_ROOT / "assets" / "Performance.bin")
     model_path: Path = field(default_factory=lambda: REPO_ROOT / "models" / "piece_classifier.onnx")
 
